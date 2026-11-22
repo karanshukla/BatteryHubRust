@@ -27,43 +27,9 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
 
 use crate::device::DeviceKind;
+pub use crate::hid_coll::HidColl;
 
-/// One HID top-level collection.
-#[derive(Clone, Debug, Default)]
-pub struct HidColl {
-    pub path: String,
-    pub vid: u16,
-    pub pid: u16,
-    /// USB interface number (MI_xx in the path), -1 when unknown.
-    pub iface: i32,
-    pub usage_page: u16,
-    pub usage_id: u16,
-    pub input_len: u16,
-    pub output_len: u16,
-    pub feature_len: u16,
-    pub n_input_value_caps: u16,
-    pub n_feature_value_caps: u16,
-}
-
-impl HidColl {
-    pub fn page(&self) -> u16 {
-        self.usage_page
-    }
-    pub fn usage(&self) -> u16 {
-        self.usage_id
-    }
-    pub fn in_len(&self) -> u16 {
-        self.input_len
-    }
-    pub fn out_len(&self) -> u16 {
-        self.output_len
-    }
-    pub fn feat_len(&self) -> u16 {
-        self.feature_len
-    }
-}
-
-fn open_raw(path: &str, access: u32, overlapped: bool) -> Option<HANDLE> {
+pub(crate) fn open_raw(path: &str, access: u32, overlapped: bool) -> Option<HANDLE> {
     let flags = if overlapped { FILE_FLAG_OVERLAPPED } else { FILE_FLAGS_AND_ATTRIBUTES(0) };
     unsafe {
         CreateFileW(

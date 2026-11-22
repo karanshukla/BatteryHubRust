@@ -14,7 +14,7 @@ path = "src/lib.rs"
 name = "batteryhub-taskbar"
 path = "src/bin/taskbar.rs"
 
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies.windows]
 version = "0.62.2"
 features = [
   "Win32_Foundation",

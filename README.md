@@ -65,6 +65,7 @@ If something breaks after an update, you can always go back to an older version 
 - **Charging at a glance:** green ⚡ while charging, blue ⚡ at 100%, red percentage at or below the device's warning level.
 - **Per-device warning level:** 50 / 40 / 30 / 20 / 15 / 10 / 5%.
 - **Reacts at once** when a receiver, cable or Bluetooth device connects or disconnects, and within ~10 s when a headset on a 2.4 GHz dongle is switched on or off.
+- **Event-driven refresh:** a Logitech mouse, keyboard or headset switched on or woken behind a receiver that stays plugged in is read again about 1.5 s later, from the events the receiver and the device send (HID++ 0x41 connection notifications, HID++ 2.0 wireless-status and battery events), instead of waiting for the next check. All refresh requests (timer, menu, device changes, device events) go through one scheduler that merges bursts into a single read. Ported from the C++ BatteryHub's event-driven refresh (PR #535).
 - **Refresh interval** of 1 / 5 / 10 / 30 minutes or 1 hour.
 - **More monitors:** show the widget on all monitors, the main one only, or only one other monitor.
 - **Position and background:** move the widget away from the clock (e.g. to make room for another taskbar widget), and an optional plate behind it for transparent taskbars.
@@ -193,7 +194,7 @@ Device not shown? Use *Request support for a device...* in the right-click menu 
 
 ## Testing
 
-- **Unit tests** (`cargo test --lib`) decode recorded device reports without the hardware: SteelSeries Arctis Nova status blocks, DualSense / DualShock 4 input reports, AirPods proximity broadcasts, Google Fast Pair battery fields, Logitech voltage curves and receiver grouping. They also cover when a device is removed or shown as asleep, warning levels, colours, menu ids, the GitHub release parser, SHA-256 and version comparison.
+- **Unit tests** (`cargo test --lib`) decode recorded device reports without the hardware: SteelSeries Arctis Nova status blocks, DualSense / DualShock 4 input reports, AirPods proximity broadcasts, Google Fast Pair battery fields, Logitech voltage curves and receiver grouping, Logitech HID++ push events (receiver connection, wireless status, battery) and the refresh scheduler's coalescing rules. The push-event and scheduler tests are plain Rust and also run on Linux / macOS. They also cover when a device is removed or shown as asleep, warning levels, colours, menu ids, the GitHub release parser, SHA-256 and version comparison.
 - The **setup** has its own tests (autostart matching never touches the original app, version handling).
 - **CI** ([GitHub Actions](.github/workflows/ci.yml)) runs all tests and builds the program and the setup on every push.
 - **Resource usage** is measured with [bench/compare.ps1](bench/compare.ps1) (two programs side by side) and [bench/measure.ps1](bench/measure.ps1).
@@ -211,12 +212,14 @@ This builds the program, then the setup with the program embedded (`installer/`,
 | Path | Contents |
 |---|---|
 | `src/` | Library: HID layer, device drivers, BLE watcher, settings, update check, UI and setup helpers |
+| `src/refresh.rs`, `src/hid_listener.rs`, `src/drivers/*_events.rs` | Event-driven refresh: the scheduler, the HID event listener and the vendor event decoders |
 | `src/bin/taskbar.rs` | The taskbar program |
 | `installer/` | The setup (`src/setup.rs`) |
 | `res/` | Icon (`make_icon.py` draws it), manifest, resource script |
 | `bench/` | Resource measurement scripts and results |
 | `.github/workflows/ci.yml` | CI: tests and builds on every push |
 | `examples/list.rs` | Console diagnostics: `cargo run --example list -- --dump --ble`, `-- --update` |
+| `examples/events.rs` | Push-event diagnostics: `cargo run --example events -- 60` prints what the event listener sees for 60 s and whether each Logitech receiver has its connection notifications on |
 
 ## License
 

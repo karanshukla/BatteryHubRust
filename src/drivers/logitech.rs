@@ -9,6 +9,7 @@
 //! 0x1F20 ADC measurement (headsets). HID++ 1.0 devices: registers 0x0D and 0x07.
 //! References: Solaar, HeadsetControl (see the original logitech.cpp).
 use crate::device::{DeviceKind, DeviceStatus, PollContext};
+use super::hidpp_events::{self, FEATURE_BATTERY_STATUS, FEATURE_UNIFIED_BATTERY, FEATURE_WIRELESS_STATUS};
 use crate::hid::{self, HidColl, HidDev};
 use crate::util::{guess_kind, hex4, interpolate, Deadline};
 
@@ -132,41 +133,36 @@ fn kind_from_type(t: u8) -> DeviceKind {
 }
 
 /// Fills battery fields from whichever battery feature the device has. Returns false if none.
-fn read_battery20(h: &Hidpp, idx: u8, pid: u16, s: &mut DeviceStatus) -> bool {
-    let f = h.feature_index(idx, 0x1004); // UNIFIED_BATTERY: get_status (fn 1)
+/// The battery features found are remembered for the event listener (see hidpp_events), keyed by
+/// `link`, the physical receiver / cable / Bluetooth link.
+fn read_battery20(h: &Hidpp, link: &str, idx: u8, pid: u16, s: &mut DeviceStatus) -> bool {
+    let apply = |b: hidpp_events::Battery, s: &mut DeviceStatus| {
+        s.percent = b.percent;
+        if !b.level_text.is_empty() {
+            s.level_text = b.level_text.into();
+        }
+        s.charging = b.charging;
+        s.full = b.full;
+    };
+    let f = h.feature_index(idx, FEATURE_UNIFIED_BATTERY); // get_status (fn 1)
     if f != 0 {
-        if let Some(p) = h.call(idx, f, 1, &[]).filter(|p| p.len() >= 3) {
-            let (soc, level, st) = (p[0] as i32, p[1], p[2]);
-            if soc > 0 && soc <= 100 {
-                s.percent = soc;
-            } else if level != 0 {
-                let (pct, txt) = if level & 8 != 0 {
-                    (100, "Full")
-                } else if level & 4 != 0 {
-                    (60, "Good")
-                } else if level & 2 != 0 {
-                    (20, "Low")
-                } else {
-                    (5, "Critical")
-                };
-                s.percent = pct;
-                s.level_text = txt.into();
+        if let Some(b) = h.call(idx, f, 1, &[]).as_deref().and_then(hidpp_events::unified_battery) {
+            hidpp_events::remember_feature(link, idx, FEATURE_UNIFIED_BATTERY, f);
+            // Keep what an earlier reading said when this one reports neither a % nor a level.
+            if b.percent >= 0 {
+                apply(b, s);
+            } else {
+                s.charging = b.charging;
+                s.full = b.full;
             }
-            s.charging = matches!(st, 1..=3);
-            s.full = st == 3;
             return true;
         }
     }
-    let f = h.feature_index(idx, 0x1000); // BATTERY_STATUS
+    let f = h.feature_index(idx, FEATURE_BATTERY_STATUS); // get_level (fn 0)
     if f != 0 {
-        if let Some(p) = h.call(idx, f, 0, &[]).filter(|p| p.len() >= 3) {
-            let st = p[2];
-            s.charging = (1..=4).contains(&st);
-            s.full = st == 3;
-            s.percent = if p[0] <= 100 { p[0] as i32 } else { -1 };
-            if s.percent == 0 && st == 3 {
-                s.percent = 100;
-            }
+        if let Some(b) = h.call(idx, f, 0, &[]).as_deref().and_then(hidpp_events::battery_status) {
+            hidpp_events::remember_feature(link, idx, FEATURE_BATTERY_STATUS, f);
+            apply(b, s);
             return true;
         }
     }
@@ -271,24 +267,18 @@ fn read_battery10(h: &Hidpp, idx: u8, s: &mut DeviceStatus) -> bool {
     false
 }
 
-/// Identifies the physical device a HID collection belongs to, so two receivers with the same
-/// product id are polled separately (strips "&colNN" and the last "&NNNN" of the instance part).
+/// WIRELESS_DEVICE_STATUS (0x1D4B): the device announces a reconnection with an event on this
+/// feature. Looked up once per device and remembered for the event listener.
+fn remember_wireless_status(h: &Hidpp, link: &str, idx: u8) {
+    if hidpp_events::known_index(link, idx, FEATURE_WIRELESS_STATUS).is_some() {
+        return;
+    }
+    let f = h.feature_index(idx, FEATURE_WIRELESS_STATUS);
+    hidpp_events::remember_feature(link, idx, FEATURE_WIRELESS_STATUS, f);
+}
+
 fn physical_key(c: &HidColl) -> String {
-    let p = c.path.to_lowercase();
-    let parts: Vec<&str> = p.splitn(4, '#').collect();
-    if parts.len() < 4 {
-        return String::new();
-    }
-    let mut hw = parts[1].to_string();
-    if let Some(col) = hw.find("&col") {
-        let end = (col + 6).min(hw.len());
-        hw.replace_range(col..end, "");
-    }
-    let mut inst = parts[2].to_string();
-    if let Some(amp) = inst.rfind('&') {
-        inst.truncate(amp);
-    }
-    format!("{hw}#{inst}")
+    c.physical_key()
 }
 
 fn poll_device(ctx: &mut PollContext, pid: u16, shorts: &[HidColl], longs: &[HidColl], suffix: &str) -> bool {
@@ -297,6 +287,7 @@ fn poll_device(ctx: &mut PollContext, pid: u16, shorts: &[HidColl], longs: &[Hid
     }
     let Some(h) = Hidpp::open(shorts.first(), longs.first()) else { return false };
     let main = longs.first().or(shorts.first()).unwrap();
+    let link = main.physical_key();
     let product = hid::product_string(main);
     let is_receiver = product.contains("Receiver");
 
@@ -330,7 +321,10 @@ fn poll_device(ctx: &mut PollContext, pid: u16, shorts: &[HidColl], longs: &[Hid
         match ping(idx) {
             Reply::Ok(p) if p.len() >= 3 && p[0] >= 2 => {
                 read_name_and_type20(&h, idx, &mut s);
-                found = read_battery20(&h, idx, pid, &mut s);
+                found = read_battery20(&h, &link, idx, pid, &mut s);
+                if found {
+                    remember_wireless_status(&h, &link, idx);
+                }
                 let unit = if found { read_unit_id20(&h, idx) } else { String::new() };
                 if !unit.is_empty() {
                     s.key = format!("logi:unit:{unit}");
