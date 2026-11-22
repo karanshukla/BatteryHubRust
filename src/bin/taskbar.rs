@@ -8,9 +8,13 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::time::Instant;
 
 use batteryhub::device::Missing;
+use batteryhub::drivers::event_decoders::hid_event_decoders;
+use batteryhub::hid_listener::HidEventListener;
+use batteryhub::refresh::{RefreshReason, RefreshReasons, RefreshScheduler, RefreshSink};
 use batteryhub::settings;
 use batteryhub::ui::{self, rgb, split};
 use batteryhub::{DeviceKind, DeviceStatus};
@@ -36,11 +40,14 @@ const WM_QUICK_DONE: u32 = WM_APP + 4;
 const WM_UPDATE_CHECKED: u32 = WM_APP + 5;
 const WM_UPDATE_DOWNLOADED: u32 = WM_APP + 6;
 const WM_SHOW_UPDATED: u32 = WM_APP + 7;
+/// A refresh was requested (from any thread): re-arm TIMER_REFRESH for the earliest due one.
+const WM_REFRESH_PLAN: u32 = WM_APP + 8;
 // Not exported by the windows crate's WindowsAndMessaging module.
 const WM_MOUSELEAVE: u32 = 0x02A3;
-const TIMER_POLL: usize = 1;
+/// The one refresh timer: armed for whatever the RefreshScheduler says is due next (the regular
+/// interval, a device change, a device event, the menu).
+const TIMER_REFRESH: usize = 1;
 const TIMER_PLACE: usize = 2;
-const TIMER_DEVCHANGE: usize = 3;
 const TIMER_BTWATCH: usize = 4;
 const TIMER_QUICK: usize = 5;
 const TIMER_AUTO_UPDATE: usize = 6;
@@ -142,8 +149,8 @@ struct App {
     next_uid: u32,
     /// Last Bluetooth connection signature (connect / disconnect detection).
     bt_sig: u64,
-    /// A device change arrived while a read was running: read again as soon as it finishes.
-    pending_change: bool,
+    /// "Refresh devices" was chosen: forget every known device on the poll it schedules.
+    forget_next: bool,
     /// Receivers / cables (vid, pid) whose device reported "off" in the last read.
     offline_hw: HashSet<(u16, u16)>,
     /// Light taskbar theme and the optional extra gap (TaskbarOffset), read once and again only
@@ -168,7 +175,50 @@ struct App {
     updated_from: Option<String>,
 }
 
+/// Every refresh request goes through here (see batteryhub::refresh); TIMER_REFRESH polls when it
+/// says so. Requests that arrive while a read runs stay pending until it finishes. Kept outside
+/// App so emitters never depend on borrowing it.
+static SCHEDULER: std::sync::OnceLock<Arc<RefreshScheduler>> = std::sync::OnceLock::new();
+
+fn request(why: RefreshReason, delay_ms: u32) {
+    if let Some(s) = SCHEDULER.get() {
+        s.request_refresh(why, delay_ms);
+    }
+}
+
+/// Windows saw the device set change (or the PC woke up): read once the burst settles, and let
+/// the listener reopen what it holds.
+fn devices_changed(why: RefreshReason, delay_ms: u32) {
+    request(why, delay_ms);
+    LISTENER.with(|l| {
+        if let Some(l) = l.borrow().as_ref() {
+            l.devices_changed();
+        }
+    });
+}
+
+/// Starts or stops the event listener to match "Refresh when a device connects or disconnects".
+fn sync_listener() {
+    LISTENER.with(|l| {
+        let mut l = l.borrow_mut();
+        if !refresh_on_change() {
+            *l = None; // stops and joins the listener thread
+            return;
+        }
+        if l.is_some() {
+            return;
+        }
+        let Some(s) = SCHEDULER.get().cloned() else { return };
+        let log: Option<batteryhub::hid_listener::Log> =
+            std::env::var_os("BH_DEBUG").is_some().then(|| Box::new(|m: &str| dbg_log(&format!("event: {m}"))) as _);
+        *l = HidEventListener::start(hid_event_decoders(), s, log);
+    });
+}
+
 thread_local! {
+    /// Push events from HID devices (Logitech receivers, dongles, Bluetooth): a device switched on
+    /// or woken behind a receiver that stays plugged in, which Windows does not report.
+    static LISTENER: RefCell<Option<HidEventListener>> = const { RefCell::new(None) };
     static APP: RefCell<App> = RefCell::new(App::default());
     /// Receivers being read by the running quick read.
     static QUICK_IDS: RefCell<Vec<(u16, u16)>> = const { RefCell::new(Vec::new()) };
@@ -1112,23 +1162,51 @@ impl App {
 
     // ---- polling -------------------------------------------------------------------------------
 
-    fn start_poll(&mut self) {
-        if self.polling {
-            // A read (full or quick) is running: if this one is for a device change, do it right
-            // after, instead of losing it.
-            if self.devchange || self.forget {
-                self.pending_change = true;
+    /// Arms TIMER_REFRESH for the earliest pending request (after WM_REFRESH_PLAN and every read).
+    fn arm_refresh(&self) {
+        let Some(s) = SCHEDULER.get() else { return };
+        unsafe {
+            match s.wait_ms() {
+                None => {
+                    let _ = KillTimer(Some(self.main), TIMER_REFRESH);
+                }
+                Some(ms) => {
+                    SetTimer(Some(self.main), TIMER_REFRESH, ms.clamp(10, u32::MAX as u64) as u32, None);
+                }
             }
+        }
+    }
+
+    /// TIMER_REFRESH: read whatever is due. While a read runs the requests stay pending, and the
+    /// timer is re-armed when it finishes.
+    fn on_refresh_timer(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.main), TIMER_REFRESH);
+        }
+        if self.polling {
             return;
         }
+        let due = SCHEDULER.get().map(|s| s.take_due()).unwrap_or_default();
+        if due.is_empty() {
+            self.arm_refresh();
+            return;
+        }
+        self.start_poll(due);
+    }
+
+    fn start_poll(&mut self, due: RefreshReasons) {
+        // A device was plugged in / removed or the PC woke up: gone devices disappear at once.
+        self.devchange |= due.has(RefreshReason::DeviceChange) || due.has(RefreshReason::Resume);
+        self.manual |= due.has(RefreshReason::Manual);
+        self.forget |= std::mem::take(&mut self.forget_next);
         self.polling = true;
         // Enumerate the devices again only when something may have changed; a periodic read
         // reuses the device list (and still notices added / removed HID devices).
         let rescan = !self.scanned || self.devchange || self.forget;
         self.scanned = true;
         dbg_log(&format!(
-            "poll started (device change: {}, rescan: {rescan}, interval: {} min)",
-            self.devchange,
+            "poll started (why: {}, rescan: {rescan}, interval: {} min)",
+            due.names().join(", "),
             refresh_minutes()
         ));
         ui::poll_async(self.main, WM_POLL_DONE, rescan);
@@ -1185,10 +1263,7 @@ impl App {
             self.offline_hw.remove(id);
         }
         self.merge(fresh);
-        if std::mem::take(&mut self.pending_change) {
-            self.devchange = true;
-            self.start_poll();
-        }
+        self.arm_refresh(); // requests that arrived during the read
     }
 
     /// Adds / updates the devices of a read; devices reporting "off" are removed and their
@@ -1215,9 +1290,9 @@ impl App {
     /// Menu refresh: `devices` = full rescan that drops devices that are gone right away;
     /// otherwise only the battery levels are read again (devices keep their grace period).
     fn manual_refresh(&mut self, devices: bool) {
-        self.forget |= devices;
+        self.forget_next |= devices;
         self.manual = true;
-        self.start_poll();
+        request(RefreshReason::Manual, 0);
         self.paint(); // shows the ↻ indicator
     }
 
@@ -1253,10 +1328,8 @@ impl App {
         });
         self.offline_hw.clear();
         self.merge(fresh);
-        if std::mem::take(&mut self.pending_change) {
-            self.devchange = true;
-            self.start_poll();
-        }
+        // The next regular read; anything requested during this one is still pending and wins if sooner.
+        request(RefreshReason::Timer, refresh_minutes() * 60_000);
     }
 }
 
@@ -1822,11 +1895,13 @@ unsafe fn show_menu() {
                 let on = !refresh_on_change();
                 save_dword("RefreshOnDeviceChange", on as u32);
                 ON_CHANGE.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+                sync_listener();
             }
             id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {
                 let minutes = INTERVALS[id - ID_INTERVAL_BASE].0;
                 save_dword("RefreshMinutes", minutes);
-                SetTimer(Some(main), TIMER_POLL, minutes * 60_000, None);
+                // Sooner than the pending regular read: takes effect now; later: from the next read on.
+                request(RefreshReason::Timer, minutes * 60_000);
             }
             id => {
                 if let Some((dev, level)) = settings::decode_menu_id(id) {
@@ -1876,12 +1951,7 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             }
             WM_TIMER => {
                 with_app(|a| match wp.0 {
-                    TIMER_POLL => a.start_poll(),
-                    TIMER_DEVCHANGE => {
-                        let _ = KillTimer(Some(hwnd), TIMER_DEVCHANGE);
-                        a.devchange = true;
-                        a.start_poll();
-                    }
+                    TIMER_REFRESH => a.on_refresh_timer(),
                     TIMER_QUICK => a.start_quick(),
                     TIMER_UPDATED => {
                         let _ = KillTimer(Some(hwnd), TIMER_UPDATED);
@@ -1905,7 +1975,7 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                             let sig = batteryhub::drivers::bluetooth::connection_signature();
                             if sig != a.bt_sig {
                                 a.bt_sig = sig;
-                                SetTimer(Some(hwnd), TIMER_DEVCHANGE, 1500, None);
+                                devices_changed(RefreshReason::DeviceChange, 1500);
                             }
                             trim_memory();
                         }
@@ -1920,9 +1990,13 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             // node change): read again once things settle, if the user left that option on.
             WM_DEVICECHANGE_MSG if matches!(wp.0, DBT_DEVNODES_CHANGED | DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE) => {
                 if refresh_on_change() {
-                    SetTimer(Some(hwnd), TIMER_DEVCHANGE, 1500, None);
+                    devices_changed(RefreshReason::DeviceChange, 1500);
                 }
                 LRESULT(1)
+            }
+            WM_REFRESH_PLAN => {
+                with_app(|a| a.arm_refresh());
+                LRESULT(0)
             }
             WM_QUICK_DONE => {
                 let devices = ui::take_result(lp);
@@ -1955,7 +2029,8 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             }
             WM_POWERBROADCAST if wp.0 == PBT_APMRESUMEAUTOMATIC => {
                 if refresh_on_change() {
-                    SetTimer(Some(hwnd), TIMER_DEVCHANGE, 5000, None);
+                    // Handles go stale over sleep: the listener reopens them too.
+                    devices_changed(RefreshReason::Resume, 5000);
                 }
                 LRESULT(1)
             }
@@ -1967,6 +2042,7 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                 LRESULT(0)
             }
             WM_DESTROY => {
+                LISTENER.with(|l| *l.borrow_mut() = None);
                 with_app(|a| {
                     if !a.strip.0.is_null() {
                         let _ = DestroyWindow(a.strip);
@@ -2077,9 +2153,13 @@ fn main() {
                 a.ensure_strip();
             }
             a.bt_sig = batteryhub::drivers::bluetooth::connection_signature();
-            a.start_poll();
         });
-        SetTimer(Some(main), TIMER_POLL, refresh_minutes() * 60_000, None);
+        let h = main.0 as usize;
+        let _ = SCHEDULER.set(Arc::new(RefreshScheduler::new(move || {
+            let _ = PostMessageW(Some(HWND(h as *mut c_void)), WM_REFRESH_PLAN, WPARAM(0), LPARAM(0));
+        })));
+        request(RefreshReason::Startup, 0);
+        sync_listener();
         SetTimer(Some(main), TIMER_PLACE, 1000, None);
         SetTimer(Some(main), TIMER_BTWATCH, 3000, None);
         SetTimer(Some(main), TIMER_QUICK, QUICK_MS, None);
